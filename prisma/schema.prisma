@@ -1,0 +1,275 @@
+// Inventory / Request Management System — data model
+// Docs: https://www.prisma.io/docs
+//
+// After editing this file run:
+//   npx prisma migrate dev --name <change>
+//   npx prisma generate
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// Application roles. MANAGER / FINANCE / DIRECTOR are the approver tiers used
+/// by the multi-level approval workflow; ADMIN manages master data.
+enum Role {
+  REQUESTER
+  MANAGER
+  FINANCE
+  DIRECTOR
+  ADMIN
+}
+
+/// Lifecycle of a purchase / item request.
+enum RequestStatus {
+  DRAFT
+  SUBMITTED
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  CANCELLED
+  FULFILLED
+}
+
+/// Decision recorded on a single approval step.
+enum ApprovalDecision {
+  PENDING
+  APPROVED
+  REJECTED
+  SKIPPED
+}
+
+enum StockMovementType {
+  IN
+  OUT
+  ADJUSTMENT
+}
+
+// ---------------------------------------------------------------------------
+// Organisation & users
+// ---------------------------------------------------------------------------
+
+model Department {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  code      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users    User[]
+  requests Request[]
+}
+
+model User {
+  id           String      @id @default(cuid())
+  email        String      @unique
+  passwordHash String
+  name         String
+  role         Role        @default(REQUESTER)
+  isActive     Boolean     @default(true)
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  requestsCreated       Request[]         @relation("RequestRequester")
+  stageAssignments      ApprovalStage[]   @relation("StageApprover")
+  approvalStepsAssigned ApprovalStep[]    @relation("StepApprover")
+  approvalStepsDecided  ApprovalStep[]    @relation("StepDecidedBy")
+  activities            RequestActivity[]
+  stockMovements        StockMovement[]
+
+  @@index([role])
+  @@index([departmentId])
+}
+
+// ---------------------------------------------------------------------------
+// Catalog / inventory master data
+// ---------------------------------------------------------------------------
+
+model Category {
+  id       String     @id @default(cuid())
+  name     String
+  parentId String?
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+
+  items Item[]
+
+  @@unique([parentId, name])
+}
+
+model Item {
+  id          String   @id @default(cuid())
+  sku         String   @unique
+  name        String
+  description String?
+  categoryId  String
+  category    Category @relation(fields: [categoryId], references: [id])
+  unit        String   @default("pcs")
+  unitPrice   Decimal  @default(0) @db.Decimal(14, 2)
+  stockQty    Int      @default(0)
+  minStock    Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  requestItems   RequestItem[]
+  stockMovements StockMovement[]
+
+  @@index([categoryId])
+}
+
+// ---------------------------------------------------------------------------
+// Approval workflow (template)
+// ---------------------------------------------------------------------------
+
+/// A workflow is picked for a request based on its estimated total value
+/// (minAmount inclusive, maxAmount exclusive; null maxAmount = no upper bound).
+model ApprovalWorkflow {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  minAmount   Decimal  @default(0) @db.Decimal(14, 2)
+  maxAmount   Decimal? @db.Decimal(14, 2)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  stages   ApprovalStage[]
+  requests Request[]
+}
+
+model ApprovalStage {
+  id           String           @id @default(cuid())
+  workflowId   String
+  workflow     ApprovalWorkflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  sequence     Int
+  name         String
+  approverRole Role
+  /// Optional explicit approver. When null the approver is resolved at submit
+  /// time from `approverRole` (preferring someone in the requester's department).
+  approverId   String?
+  approver     User?            @relation("StageApprover", fields: [approverId], references: [id])
+
+  @@unique([workflowId, sequence])
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+model Request {
+  id             String            @id @default(cuid())
+  requestNo      String            @unique
+  requesterId    String
+  requester      User              @relation("RequestRequester", fields: [requesterId], references: [id])
+  departmentId   String
+  department     Department        @relation(fields: [departmentId], references: [id])
+  workflowId     String?
+  workflow       ApprovalWorkflow? @relation(fields: [workflowId], references: [id])
+  purpose        String
+  status         RequestStatus     @default(DRAFT)
+  /// Sequence of the approval step currently awaiting a decision (0 while DRAFT).
+  currentStage   Int               @default(0)
+  estimatedTotal Decimal           @default(0) @db.Decimal(14, 2)
+  neededBy       DateTime?
+  submittedAt    DateTime?
+  closedAt       DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  items          RequestItem[]
+  approvalSteps  ApprovalStep[]
+  activities     RequestActivity[]
+  stockMovements StockMovement[]
+
+  @@index([status])
+  @@index([departmentId])
+  @@index([requesterId])
+  @@index([submittedAt])
+}
+
+model RequestItem {
+  id          String  @id @default(cuid())
+  requestId   String
+  request     Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  itemId      String?
+  item        Item?   @relation(fields: [itemId], references: [id])
+  name        String
+  description String?
+  quantity    Int
+  unit        String  @default("pcs")
+  unitPrice   Decimal @default(0) @db.Decimal(14, 2)
+  lineTotal   Decimal @default(0) @db.Decimal(14, 2)
+
+  @@index([requestId])
+  @@index([itemId])
+}
+
+/// One instance per approval level, created when the request is submitted.
+model ApprovalStep {
+  id           String           @id @default(cuid())
+  requestId    String
+  request      Request          @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  stageId      String?
+  sequence     Int
+  name         String
+  approverRole Role
+  approverId   String?
+  approver     User?            @relation("StepApprover", fields: [approverId], references: [id])
+  decision     ApprovalDecision @default(PENDING)
+  decidedById  String?
+  decidedBy    User?            @relation("StepDecidedBy", fields: [decidedById], references: [id])
+  note         String?
+  decidedAt    DateTime?
+  createdAt    DateTime         @default(now())
+
+  @@unique([requestId, sequence])
+  @@index([approverId, decision])
+  @@index([decision])
+}
+
+/// Immutable audit trail — powers status tracking and history views.
+model RequestActivity {
+  id         String         @id @default(cuid())
+  requestId  String
+  request    Request        @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  actorId    String?
+  actor      User?          @relation(fields: [actorId], references: [id])
+  action     String
+  fromStatus RequestStatus?
+  toStatus   RequestStatus?
+  note       String?
+  createdAt  DateTime       @default(now())
+
+  @@index([requestId])
+  @@index([createdAt])
+}
+
+model StockMovement {
+  id           String            @id @default(cuid())
+  itemId       String
+  item         Item              @relation(fields: [itemId], references: [id])
+  requestId    String?
+  request      Request?          @relation(fields: [requestId], references: [id])
+  type         StockMovementType
+  quantity     Int
+  balanceAfter Int
+  note         String?
+  createdById  String?
+  createdBy    User?             @relation(fields: [createdById], references: [id])
+  createdAt    DateTime          @default(now())
+
+  @@index([itemId])
+  @@index([requestId])
+}
